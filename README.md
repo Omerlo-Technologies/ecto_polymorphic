@@ -1,6 +1,10 @@
 # EctoPolymorphic
 
-**TODO: Add description**
+`ecto_polymorphic` extends [ParameterizedType](https://hexdocs.pm/ecto/Ecto.ParameterizedType.html) from ecto.
+
+In nutshell, you can create complex embeds using the power of Ecto.
+
+> Inspired by https://github.com/mathieuprog/polymorphic_embed.
 
 ## Installation
 

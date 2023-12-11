@@ -120,8 +120,6 @@ defmodule EctoPolymorphic do
     else
       {:parameterized, __MODULE__, options} -> Map.put(options, :array?, false)
       {:array, {:parameterized, __MODULE__, options}} -> Map.put(options, :array?, true)
-      # Dunno when it could happen
-      # {_, {:parameterized, __MODULE__, options}} -> Map.put(options, :array?, false)
       nil -> raise ArgumentError, "#{field} is not a visual"
     end
   end
