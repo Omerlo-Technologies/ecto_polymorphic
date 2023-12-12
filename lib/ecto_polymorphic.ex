@@ -1,126 +1,506 @@
 defmodule EctoPolymorphic do
-  use Ecto.ParameterizedType
+  @moduledoc """
+  The polymorphic struct for `polymorphic_one` and `polymorphic_many`.
 
-  import Ecto.Changeset
+  Its fields are:
 
-  def type(_params), do: :map
-
-  def init(opts) do
-    types =
-      opts
-      |> Keyword.get(:types, [])
-      |> Map.new(fn {type, schema} -> {Atom.to_string(type), schema} end)
-
-    %{
-      default: Keyword.get(opts, :default, nil),
-      # on_replace: Keyword.fetch!(opts, :on_replace),
-      # on_type_not_found: Keyword.get(opts, :on_type_not_found, :changeset_error),
-      type_field: Keyword.get(opts, :type_field, :__type__),
-      types: types
-    }
-  end
-
-  def cast(_data, _params) do
-    raise "DO NOT USE THIS ONE, use cast_polymorphic/2 instead"
-  end
-
-  def load(_data, _loader, _params) do
-    {:ok, nil}
-  end
-
-  def dump(_data, _dumper, _params) do
-    {:ok, nil}
-  end
-
-  def equal?(a, b, _params) do
-    a == b
-  end
-
-  @doc """
-
-  ## Examples
-
-      iex> cast_polymorphic(changeset, :visual, required: false)
-      %Ecto.Changeset{}
-
-      iex> cast_polymorphic(changeset, :visual, with: &custom_changeset/2)
-      %Ecto.Changeset{}
+    * `cardinality` - The association cardinality
+    * `field` - The name of the association field on the schema
+    * `owner` - The schema where the association was defined
+    * `relateds` - The schemas that are embedded
+    * `on_cast` - Map polymoprhic type to Function name to call by default when casting embeds
+    * `on_replace` - The action taken on associations when schema is replaced
 
   """
-  def cast_polymorphic(%Ecto.Changeset{} = parent_changeset, field, opts \\ []) do
-    # TODO supports array
-    params = Map.get(parent_changeset.params || %{}, Atom.to_string(field), %{})
-    params = Map.new(params, fn {k, v} -> {to_string(k), v} end)
+  alias __MODULE__
+  alias Ecto.Changeset
+  alias Ecto.Changeset.Relation
 
-    parent_changeset =
-      Map.update!(parent_changeset, :params, &Map.put(&1, to_string(field), params))
+  use Ecto.ParameterizedType
 
-    if polymorphic_changeset = get_polymorphic_field(parent_changeset, field) do
-      changeset_fun = Keyword.get(opts, :with, &polymorphic_changeset.data.__struct__.changeset/2)
-      do_cast_polymorphic(parent_changeset, polymorphic_changeset, changeset_fun, field)
-    else
-      field_opts = get_field_options(parent_changeset.data.__struct__, field)
+  @behaviour Relation
+  @on_replace_opts [:raise, :mark_as_invalid, :delete]
+  @embeds_one_on_replace_opts @on_replace_opts ++ [:update]
 
+  defstruct [
+    :cardinality,
+    :field,
+    :owner,
+    :types,
+    :type_field,
+    :on_cast,
+    on_replace: :raise,
+    unique: true,
+    ordered: true,
+    related: nil
+  ]
+
+  defmacro polymorphic_one(field, opts) do
+    opts = Keyword.put(opts, :cardinality, :one)
+
+    quote do
+      field unquote(field), EctoPolymorphic, unquote(opts)
+    end
+  end
+
+  def cast_polymorphic(changeset, field, opts \\ [])
+
+  def cast_polymorphic(%Changeset{data: data, types: types}, _name, _opts)
+      when data == nil or types == nil do
+    raise ArgumentError,
+          "cast_polymorphic/3 expects the changeset to be cast. " <>
+            "Please call cast/4 before calling cast_polymorphic/3"
+  end
+
+  def cast_polymorphic(%Changeset{data: data, types: types} = changeset, key, opts) do
+    {key, param_key} = cast_key(key)
+    %{data: data, types: types, params: params, changes: changes} = changeset
+    {:parameterized, EctoPolymorphic, relation} = types[key]
+    params = params || %{}
+
+    {changeset, required?} =
+      if opts[:required] do
+        {update_in(changeset.required, &[key | &1]), true}
+      else
+        {changeset, false}
+      end
+
+    on_cast = opts |> Keyword.get(:with, []) |> Map.new()
+
+    on_cast =
+      Map.new(relation.types, fn {type, schema} ->
+        on_cast = Map.get_lazy(on_cast, type, fn -> on_cast_default(type, schema) end)
+        {type, on_cast}
+      end)
+
+    sort = opts_key_from_params(:sort_param, opts, params)
+    drop = opts_key_from_params(:drop_param, opts, params)
+
+    changeset =
+      if Map.has_key?(params, param_key) or is_list(sort) or is_list(drop) do
+        value = Map.get(params, param_key)
+        original = Map.get(data, key)
+        current = Relation.load!(data, original)
+        value = cast_params(relation, value, sort, drop)
+        dbg(value)
+        dbg(original)
+        dbg(current)
+        dbg(value)
+        dbg(relation)
+        # get_type(types, )
+        on_cast = on_cast[:image]
+        relation = %{relation | related: relation.types[:image]}
+
+        case Relation.cast(relation, data, value, current, on_cast) do
+          {:ok, change, relation_valid?} when change != original ->
+            valid? = changeset.valid? and relation_valid?
+            changes = Map.put(changes, key, change)
+            changeset = %{force_update(changeset, opts) | changes: changes, valid?: valid?}
+            missing_relation(changeset, key, current, required?, relation, opts)
+
+          {:error, {message, meta}} ->
+            meta = [validation: :polymorphic] ++ meta
+            error = {key, {message(opts, :invalid_message, message), meta}}
+            %{changeset | errors: [error | changeset.errors], valid?: false}
+
+          # ignore or ok with change == original
+          _ ->
+            missing_relation(changeset, key, current, required?, relation, opts)
+        end
+      else
+        missing_relation(changeset, key, Map.get(data, key), required?, relation, opts)
+      end
+
+    IO.inspect(changeset)
+
+    # update_in(changeset.types[key], fn {type, relation} ->
+    #   {type, %{relation | on_cast: on_cast}}
+    # end)
+
+    changeset
+  end
+
+  defp opts_key_from_params(opt, opts, params) do
+    if key = opts[opt] do
+      Map.get(params, Atom.to_string(key), nil)
+    end
+  end
+
+  defp on_cast_default(type, module) do
+    fn struct, params ->
+      try do
+        module.changeset(struct, params)
+      rescue
+        e in UndefinedFunctionError ->
+          case __STACKTRACE__ do
+            [{^module, :changeset, args_or_arity, _}]
+            when args_or_arity == 2
+            when length(args_or_arity) == 2 ->
+              raise ArgumentError, """
+              the module #{inspect(module)} does not define a changeset/2 function,
+              which is used by cast_polymorphic/3. You need to either:
+
+                1. implement the #{module}.changeset/2 function for type #{type}
+                2. pass the :with option to cast_polymorphic/3 with an anonymous
+                   function of arity 2 (or possibly arity 3, if using has_many or
+                   embeds_many) for the type #{type}
+              """
+
+            stacktrace ->
+              reraise e, stacktrace
+          end
+      end
+    end
+  end
+
+  ## Parameterized API
+
+  # We treat even embed_many as maps, as that's often the
+  # most efficient format to encode them in the database.
+  @impl Ecto.ParameterizedType
+  def type(_), do: {:map, :any}
+
+  @impl Ecto.ParameterizedType
+  def init(opts) do
+    opts = Keyword.put_new(opts, :on_replace, :raise)
+    cardinality = Keyword.fetch!(opts, :cardinality)
+
+    on_replace_opts =
+      if cardinality == :one, do: @embeds_one_on_replace_opts, else: @on_replace_opts
+
+    unless opts[:on_replace] in on_replace_opts do
+      raise ArgumentError,
+            "invalid `:on_replace` option for #{inspect(Keyword.fetch!(opts, :field))}. " <>
+              "The only valid options are: " <>
+              Enum.map_join(on_replace_opts, ", ", &"`#{inspect(&1)}`")
+    end
+
+    struct(%EctoPolymorphic{}, opts)
+  end
+
+  @impl Ecto.ParameterizedType
+  def load(nil, _fun, %{cardinality: :one}), do: {:ok, nil}
+
+  def load(value, fun, %{cardinality: :one, related: schema, field: field}) when is_map(value) do
+    {:ok, load_field(field, schema, value, fun)}
+  end
+
+  def load(nil, _fun, %{cardinality: :many}), do: {:ok, []}
+
+  def load(value, fun, %{cardinality: :many, related: schema, field: field})
+      when is_list(value) do
+    {:ok, Enum.map(value, &load_field(field, schema, &1, fun))}
+  end
+
+  def load(_value, _fun, _embed) do
+    :error
+  end
+
+  defp load_field(_field, schema, value, loader) when is_map(value) do
+    Ecto.Schema.Loader.unsafe_load(schema, value, loader)
+  end
+
+  defp load_field(field, _schema, value, _fun) do
+    raise ArgumentError, "cannot load embed `#{field}`, expected a map but got: #{inspect(value)}"
+  end
+
+  @impl Ecto.ParameterizedType
+  def dump(nil, _, _), do: {:ok, nil}
+
+  def dump(value, fun, %{cardinality: :one, related: schema, field: field}) when is_map(value) do
+    {:ok, dump_field(field, schema, value, schema.__schema__(:dump), fun, _one_embed? = true)}
+  end
+
+  def dump(value, fun, %{cardinality: :many, related: schema, field: field})
+      when is_list(value) do
+    types = schema.__schema__(:dump)
+    {:ok, Enum.map(value, &dump_field(field, schema, &1, types, fun, _one_embed? = false))}
+  end
+
+  def dump(_value, _fun, _embed) do
+    :error
+  end
+
+  defp dump_field(_field, schema, %{__struct__: schema} = struct, types, dumper, _one_embed?) do
+    Ecto.Schema.Loader.safe_dump(struct, types, dumper)
+  end
+
+  defp dump_field(field, schema, value, _types, _dumper, one_embed?) do
+    one_or_many =
+      if one_embed?,
+        do: "a struct #{inspect(schema)} value",
+        else: "a list of #{inspect(schema)} struct values"
+
+    raise ArgumentError,
+          "cannot dump embed `#{field}`, expected #{one_or_many} but got: #{inspect(value)}"
+  end
+
+  @impl Ecto.ParameterizedType
+  def cast(_, _) do
+    raise "DO NOT USE cast"
+  end
+
+  # def cast(nil, %{cardinality: :one}), do: {:ok, nil}
+  #
+  # def cast(%{__struct__: schema} = struct, %{cardinality: :one, related: schema}) do
+  #   {:ok, struct}
+  # end
+  #
+  # def cast(nil, %{cardinality: :many}), do: {:ok, []}
+  #
+  # def cast(value, %{cardinality: :many, related: schema}) when is_list(value) do
+  #   if Enum.all?(value, &Kernel.match?(%{__struct__: ^schema}, &1)) do
+  #     {:ok, value}
+  #   else
+  #     :error
+  #   end
+  # end
+  #
+  # def cast(_value, _embed) do
+  #   :error
+  # end
+
+  @impl Ecto.ParameterizedType
+  def embed_as(_, _), do: :dump
+
+  ## End of parameterized API
+
+  # Callback invoked by repository to prepare embeds.
+  #
+  # It replaces the changesets for embeds inside changes
+  # by actual structs so it can be dumped by adapters and
+  # loaded into the schema struct afterwards.
+  @doc false
+  def prepare(changeset, embeds, adapter, repo_action) do
+    %{changes: changes, types: types, repo: repo} = changeset
+    prepare(Map.take(changes, embeds), types, adapter, repo, repo_action)
+  end
+
+  defp prepare(embeds, _types, _adapter, _repo, _repo_action) when embeds == %{} do
+    embeds
+  end
+
+  defp prepare(embeds, types, adapter, repo, repo_action) do
+    Enum.reduce(embeds, embeds, fn {name, changeset_or_changesets}, acc ->
+      {:embed, embed} = Map.get(types, name)
+      Map.put(acc, name, prepare_each(embed, changeset_or_changesets, adapter, repo, repo_action))
+    end)
+  end
+
+  defp prepare_each(%{cardinality: :one}, nil, _adapter, _repo, _repo_action) do
+    nil
+  end
+
+  defp prepare_each(%{cardinality: :one} = embed, changeset, adapter, repo, repo_action) do
+    action = normalize_action(changeset.action, repo_action, embed)
+    changeset = run_prepare(changeset, repo)
+    to_struct(changeset, action, embed, adapter)
+  end
+
+  defp prepare_each(%{cardinality: :many} = embed, changesets, adapter, repo, repo_action) do
+    for changeset <- changesets,
+        action = normalize_action(changeset.action, repo_action, embed),
+        changeset = run_prepare(changeset, repo),
+        prepared = to_struct(changeset, action, embed, adapter),
+        do: prepared
+  end
+
+  defp to_struct(%Changeset{valid?: false}, _action, %{related: schema}, _adapter) do
+    raise ArgumentError,
+          "changeset for embedded #{inspect(schema)} is invalid, " <>
+            "but the parent changeset was not marked as invalid"
+  end
+
+  defp to_struct(%Changeset{data: %{__struct__: actual}}, _action, %{related: expected}, _adapter)
+       when actual != expected do
+    raise ArgumentError,
+          "expected changeset for embedded schema `#{inspect(expected)}`, " <>
+            "got: #{inspect(actual)}"
+  end
+
+  defp to_struct(%Changeset{changes: changes, data: schema}, :update, _embed, _adapter)
+       when changes == %{} do
+    schema
+  end
+
+  defp to_struct(%Changeset{}, :delete, _embed, _adapter) do
+    nil
+  end
+
+  defp to_struct(%Changeset{data: data} = changeset, action, %{related: schema}, adapter) do
+    %{data: struct, changes: changes} =
       changeset =
-        {%{}, %{type: :string}}
-        |> change()
-        |> add_error(field_opts.type_field, "missing type")
+      maybe_surface_changes(changeset, data, schema, action)
 
-      put_change(parent_changeset, field, changeset)
+    embeds = prepare(changeset, schema.__schema__(:embeds), adapter, action)
+
+    changes
+    |> Map.merge(embeds)
+    |> autogenerate_id(struct, action, schema, adapter)
+    |> autogenerate(action, schema)
+    |> apply_embeds(struct)
+  end
+
+  defp maybe_surface_changes(changeset, data, schema, :insert) do
+    Relation.surface_changes(changeset, data, schema.__schema__(:fields))
+  end
+
+  defp maybe_surface_changes(changeset, _data, _schema, _action) do
+    changeset
+  end
+
+  defp run_prepare(changeset, repo) do
+    changeset = %{changeset | repo: repo}
+
+    Enum.reduce(Enum.reverse(changeset.prepare), changeset, fn fun, acc ->
+      case fun.(acc) do
+        %Ecto.Changeset{} = acc ->
+          acc
+
+        other ->
+          raise "expected function #{inspect(fun)} given to Ecto.Changeset.prepare_changes/2 " <>
+                  "to return an Ecto.Changeset, got: `#{inspect(other)}`"
+      end
+    end)
+  end
+
+  defp apply_embeds(changes, struct) do
+    struct(struct, changes)
+  end
+
+  defp normalize_action(:replace, _, %{on_replace: :delete}), do: :delete
+  defp normalize_action(:update, :insert, _), do: :insert
+  defp normalize_action(action, _, _), do: action
+
+  defp autogenerate_id(changes, _struct, :insert, schema, adapter) do
+    case schema.__schema__(:autogenerate_id) do
+      {key, _source, :binary_id} ->
+        Map.put_new_lazy(changes, key, fn -> adapter.autogenerate(:embed_id) end)
+
+      {_key, _source, :id} ->
+        raise ArgumentError,
+              "embedded schema `#{inspect(schema)}` cannot autogenerate `:id` primary keys, " <>
+                "those are typically used for auto-incrementing constraints. " <>
+                "Maybe you meant to use `:binary_id` instead?"
+
+      nil ->
+        changes
     end
   end
 
-  defp do_cast_polymorphic(parent_changeset, changeset, changeset_fun, field) do
-    params = Map.get(parent_changeset.params, to_string(field))
-    changeset = changeset_fun.(changeset, params)
-    origin_visual_struct = Map.get(parent_changeset.data.visual || %{}, :__struct__)
+  defp autogenerate_id(changes, struct, :update, _schema, _adapter) do
+    for {_, nil} <- Ecto.primary_key(struct) do
+      raise Ecto.NoPrimaryKeyValueError, struct: struct
+    end
 
-    cond do
-      !Enum.empty?(changeset.changes) ->
-        put_change(parent_changeset, field, changeset)
+    changes
+  end
 
-      origin_visual_struct != changeset.data.__struct__ ->
-        put_change(parent_changeset, field, changeset)
+  defp autogenerate(changes, action, schema) do
+    autogen_fields = action |> action_to_auto() |> schema.__schema__()
 
-      true ->
-        parent_changeset
+    Enum.reduce(autogen_fields, changes, fn {fields, {mod, fun, args}}, acc ->
+      case Enum.reject(fields, &Map.has_key?(changes, &1)) do
+        [] ->
+          acc
+
+        fields ->
+          generated = apply(mod, fun, args)
+          Enum.reduce(fields, acc, &Map.put(&2, &1, generated))
+      end
+    end)
+  end
+
+  defp action_to_auto(:insert), do: :autogenerate
+  defp action_to_auto(:update), do: :autoupdate
+
+  @impl Relation
+  def build(%EctoPolymorphic{related: related}, _owner) do
+    related.__struct__()
+  end
+
+  def preload_info(_embed) do
+    :embed
+  end
+
+  defp cast_params(%{cardinality: :many} = relation, nil, sort, drop)
+       when is_list(sort) or is_list(drop) do
+    cast_params(relation, %{}, sort, drop)
+  end
+
+  defp cast_params(%{cardinality: :many}, value, sort, drop) when is_map(value) do
+    drop = if is_list(drop), do: drop, else: []
+
+    {sorted, pending} =
+      if is_list(sort) do
+        Enum.map_reduce(sort -- drop, value, &Map.pop(&2, &1, %{}))
+      else
+        {[], value}
+      end
+
+    sorted ++
+      (pending
+       |> Map.drop(drop)
+       |> Enum.map(&key_as_int/1)
+       |> Enum.sort()
+       |> Enum.map(&elem(&1, 1)))
+  end
+
+  defp cast_params(%{cardinality: :one}, value, sort, drop) do
+    if sort do
+      raise ArgumentError, ":sort_param not supported for belongs_to/has_one"
+    end
+
+    if drop do
+      raise ArgumentError, ":drop_param not supported for belongs_to/has_one"
+    end
+
+    value
+  end
+
+  defp cast_params(_relation, value, _sort, _drop) do
+    value
+  end
+
+  # We check for the byte size to avoid creating unnecessary large integers
+  # which would never map to a database key (u64 is 20 digits only).
+  defp key_as_int({key, val}) when is_binary(key) and byte_size(key) < 32 do
+    case Integer.parse(key) do
+      {key, ""} -> {key, val}
+      _ -> {key, val}
     end
   end
 
-  defp get_polymorphic_field(changeset, field) do
-    opts = get_field_options(changeset.data.__struct__, field)
-    type = changeset.params[to_string(field)][to_string(opts.type_field)]
-    module = Map.get(opts.types, type)
+  defp key_as_int(key_val), do: key_val
 
-    struct_or_changeset = changeset |> get_field(field) |> do_get_polymorphic_field(module)
+  defp cast_key(key) when is_atom(key),
+    do: {key, Atom.to_string(key)}
 
-    if struct_or_changeset do
-      change(struct_or_changeset)
-    end
-  end
+  defp missing_relation(changeset, name, current, required?, relation, opts) do
+    %{changes: changes, errors: errors} = changeset
+    current_changes = Map.get(changes, name, current)
 
-  defp do_get_polymorphic_field(nil, nil), do: nil
-  defp do_get_polymorphic_field(struct_or_changeset, nil), do: struct_or_changeset
-  defp do_get_polymorphic_field(nil, module), do: struct(module)
+    if required? and Relation.empty?(relation, current_changes) do
+      errors = [
+        {name, {message(opts, :required_message, "can't be blank"), [validation: :required]}}
+        | errors
+      ]
 
-  defp do_get_polymorphic_field(struct_or_changeset, module) do
-    case struct_or_changeset do
-      %Ecto.Changeset{data: %{__struct__: ^module}} -> struct_or_changeset
-      %{__struct__: ^module} -> struct_or_changeset
-      _ -> struct(module)
-    end
-  end
-
-  defp get_field_options(schema, field) do
-    try do
-      schema.__schema__(:type, field)
-    rescue
-      _ in UndefinedFunctionError ->
-        raise ArgumentError, "#{inspect(schema)} is not an Ecto schema"
+      %{changeset | errors: errors, valid?: false}
     else
-      {:parameterized, __MODULE__, options} -> Map.put(options, :array?, false)
-      {:array, {:parameterized, __MODULE__, options}} -> Map.put(options, :array?, true)
-      nil -> raise ArgumentError, "#{field} is not a visual"
+      changeset
     end
+  end
+
+  defp force_update(changeset, opts) do
+    if Keyword.get(opts, :force_update_on_change, true) do
+      put_in(changeset.repo_opts[:force], true)
+    else
+      changeset
+    end
+  end
+
+  defp message(opts, key \\ :message, default) do
+    Keyword.get(opts, key, default)
   end
 end

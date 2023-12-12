@@ -7,7 +7,7 @@ defmodule EctoPolymorphic.Image do
     field :file_key, :string
   end
 
-  def changeset(struct_or_changeset, attrs \\ %{}) do
+  def special_changeset(struct_or_changeset, attrs \\ %{}) do
     struct_or_changeset
     |> cast(attrs, [:file_key])
     |> validate_required([:file_key])

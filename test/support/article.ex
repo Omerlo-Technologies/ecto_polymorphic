@@ -4,12 +4,16 @@ defmodule EctoPolymorphic.Article do
   import Ecto.Changeset
   import EctoPolymorphic
 
+  alias EctoPolymorphic.Image
+  alias EctoPolymorphic.Slideshow
+  alias EctoPolymorphic.Video
+
   schema "article" do
-    field :visual, EctoPolymorphic,
+    polymorphic_one :visual,
       types: [
-        image: EctoPolymorphic.Image,
-        slideshow: EctoPolymorphic.Slideshow,
-        video: EctoPolymorphic.Video
+        image: Image,
+        slideshow: Slideshow,
+        video: Video
       ],
       type_field: :type
   end
@@ -17,6 +21,6 @@ defmodule EctoPolymorphic.Article do
   def changeset(struct_or_changeset, attrs \\ %{}) do
     struct_or_changeset
     |> cast(attrs, [])
-    |> cast_polymorphic(:visual)
+    |> cast_polymorphic(:visual, with: [image: &Image.special_changeset/2])
   end
 end
